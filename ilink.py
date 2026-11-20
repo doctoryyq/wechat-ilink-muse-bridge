@@ -72,6 +72,14 @@ BRIDGE = os.environ.get(
 )
 os.makedirs(BRIDGE, exist_ok=True)
 os.makedirs(os.path.join(BRIDGE, "media"), exist_ok=True)
+# HARDENED: 数据目录含登录凭证等敏感文件，权限一律收紧为 700
+# （目录已存在时也收紧），不依赖进程 umask。模块导入时执行，
+# 覆盖所有命令路径。
+for _hardened_dir in (BRIDGE, os.path.join(BRIDGE, "media")):
+    try:
+        os.chmod(_hardened_dir, 0o700)
+    except OSError:
+        pass
 SESSION_FILE = os.path.join(BRIDGE, "session.json")
 CONTACTS_FILE = os.path.join(BRIDGE, "contacts.json")  # from_user_id -> {context_token, updated_at}
 SEEN_FILE = os.path.join(BRIDGE, "seen_ids.json")  # delivered inbound message_ids (dedupe)
@@ -93,6 +101,20 @@ MEDIA_MAX_BYTES = 100 * 1024 * 1024  # media sends refuse above this size:
 # is refused before its ciphertext can exhaust poll's memory.
 MEDIA_DIR = os.path.join(BRIDGE, "media")
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+
+
+def _hardened_url_allowed(url):
+    # HARDENED: 服务端下发的 URL（媒体 full_url、上传 upload_full_url、
+    # 登录 redirect）在使用前必须过域名校验：只允许 weixin.qq.com /
+    # qq.com 本域及其子域名。防止服务端被攻破或响应被篡改时，客户端
+    # 被导向任意地址下载/上传/跟随跳转。
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return (host == "weixin.qq.com" or host.endswith(".weixin.qq.com")
+            or host == "qq.com" or host.endswith(".qq.com"))
 
 # MessageItemType: TEXT=1, IMAGE=2, VOICE=3, FILE=4, VIDEO=5
 ITEM_TYPE_NAMES = {1: "text", 2: "image", 3: "voice", 4: "file", 5: "video"}
@@ -176,6 +198,12 @@ def download_media_item(item: dict, item_type: int):
     aes_key = _parse_aes_key(aes_key_b64)
     full_url = media.get("full_url")
     eqp = media.get("encrypt_query_param")
+    if full_url and not _hardened_url_allowed(full_url):
+        # HARDENED: 服务端下发的 full_url 域名不在白名单内，弃用它，
+        # 回退到用 encrypt_query_param 构造的官方 CDN 地址；
+        # 两者都不可用时走下方原有的 no download url 报错路径。
+        print("MEDIA_ERROR:full_url host not allowed", file=sys.stderr, flush=True)
+        full_url = None
     if full_url:
         url = full_url
     elif eqp:
@@ -516,7 +544,11 @@ def cmd_version_check(notify=False):
     print(f"UPDATE_AVAILABLE:{tag}")
     if not notify:
         return 0
-    return _version_notify_locked(tag, rel)
+    # HARDENED: --notify 已禁用。发送更新通知会写 update_offer 标记，
+    # 配合旧契约可把主人的随口肯定回复解释为"装更新"授权。本加固版
+    # 的 version-check 只允许本地打印结果，绝不主动发通知。
+    print("NOTIFY_DISABLED:本加固版已禁用 version-check --notify")
+    return 1
 
 
 VERSION_NOTIFY_LOCK_FILE = os.path.join(BRIDGE, "version_notify.lock")
@@ -777,6 +809,13 @@ def cmd_update_to(tag, hook_dir=None, script_path=None):
     refuses older tags (never downgrade) and tags with '/' or '..'.
     script_path defaults to the running script file (tests pass a temp
     path so the repo file is never touched)."""
+    # HARDENED: 自更新已禁用。原实现从作者 GitHub 下载代码直接替换
+    # 自身，完整性校验（release notes 中的 sha256 行）是可选的——
+    # 发布方没写时只在 stderr 警告就照常安装，信任锚只有作者账号。
+    # 本加固版拒绝一切自动更新：更新请人工审查后手动替换文件。
+    # 下方原实现保留但不可达，便于与上游 diff 对照。
+    print("UPDATE_DISABLED:本加固版已禁用自更新，更新请人工审查后手动替换")
+    return 1
     tag = (tag or "").strip()
     if not tag or "/" in tag or ".." in tag:
         print("UPDATE_FAILED:bad_tag")
@@ -1574,6 +1613,11 @@ def _print_qrcode(data):
         os.makedirs(BRIDGE, exist_ok=True)
         with open(path, "wb") as f:
             f.write(base64.b64decode(b64))
+        # HARDENED: 二维码图片等同一次性登录凭证，写入后收紧为 0600。
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         print(f"QR_IMAGE:{path}")
     elif img.startswith("http"):
         print(f"QR_URL:{img}")
@@ -1599,6 +1643,10 @@ def _follow_login_redirect(redirect):
     Absolute URLs go direct; relative paths go through api()."""
     try:
         if redirect.startswith("http"):
+            # HARDENED: 登录 redirect 的绝对 URL 必须过域名校验，
+            # 不在白名单内直接视为跟随失败（返回 {}），不发出请求。
+            if not _hardened_url_allowed(redirect):
+                return {}
             req = urllib.request.Request(redirect, method="GET")
             with urllib.request.urlopen(req, timeout=35) as resp:
                 return json.loads(resp.read().decode())
@@ -2625,6 +2673,13 @@ def _upload_media(to_user_id, data, media_type, token):
     r = api("POST", "ilink/bot/getuploadurl", body, token=token, timeout=20)
     upload_param = r.get("upload_param")
     full_url = r.get("upload_full_url")
+    if full_url and not _hardened_url_allowed(full_url):
+        # HARDENED: 服务端下发的 upload_full_url 域名不在白名单内，
+        # 弃用它，回退到用 upload_param 构造的官方 CDN 地址；
+        # 没有 upload_param 可回退时直接报错，绝不向未校验地址上传。
+        full_url = None
+        if not upload_param:
+            raise RuntimeError("getuploadurl upload_full_url host not allowed")
     if not upload_param and not full_url:
         raise RuntimeError(f"getuploadurl no upload_param: {str(r)[:200]}")
     # Prefer a server-provided full upload URL when present; fall back
@@ -2672,9 +2727,33 @@ def _media_item(path, up, media_type, playtime_ms=0):
                                      "len": str(up["rawsize"])}}
 
 
+def _hardened_check_send_path(path):
+    # HARDENED: 发文件路径白名单。目标路径经 os.path.realpath 解析后
+    # （展开符号链接与 ..），必须位于数据目录（ILINK_DATA_DIR，即
+    # BRIDGE）内，或环境变量 ILINK_SEND_DIR 指定目录内（未设置该变量
+    # 时只有数据目录）。防止微信侧消息间接诱导 agent 把本机任意文件
+    # （凭证、源码、私人文档）读出并上传到微信 CDN 发出。
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return False
+    roots = [os.path.realpath(BRIDGE)]
+    extra = os.environ.get("ILINK_SEND_DIR")
+    if extra:
+        roots.append(os.path.realpath(extra))
+    for root in roots:
+        if real == root or real.startswith(root + os.sep):
+            return True
+    return False
+
+
 @_keyed_send_locked
 def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, key=None):
     """发送图片/视频/文件（回复模式，需 context_token）。"""
+    # HARDENED: 读取文件前先过路径白名单，名单外直接拒绝。
+    if not _hardened_check_send_path(path):
+        print(f"MEDIA_PATH_DENIED:{path} 不在数据目录或 ILINK_SEND_DIR 内，拒绝发送")
+        return 1
     s = load_session()
     token = s.get("bot_token")
     if not token:
@@ -2765,6 +2844,10 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
 @_keyed_send_locked
 def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
     """主动推送图片/视频/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
+    # HARDENED: 读取文件前先过路径白名单，名单外直接拒绝。
+    if not _hardened_check_send_path(path):
+        print(f"MEDIA_PATH_DENIED:{path} 不在数据目录或 ILINK_SEND_DIR 内，拒绝发送")
+        return 1
     s = load_session()
     token = s.get("bot_token")
     if not token:

@@ -171,18 +171,24 @@ aset() {
   mv "$tmp" "$ALERT" 2>/dev/null || true
 }
 
+# HARDENED: 以下“每小时 version-check --notify”代码块已整段禁用。
+# 原因：加固版禁用自更新与一切自动更新通知（--notify 会写
+# update_offer 标记，配合旧契约可把主人的随口肯定解释为装更新
+# 授权；且每小时向 GitHub 发请求会暴露部署 IP 与使用节奏）。
+# 更新检查只允许人工在主聊天确认后手动运行 version-check（不带
+# --notify）。原代码逐行注释保留如下，便于与上游 diff 对照。
 # 更新提醒：每小时最多跑一次 version-check --notify（后台跑，不阻塞
 # 消息处理；未订阅时它只打印 NO_SUBSCRIBERS，不发任何消息）
-vc_last=$(astate vc_last)
-case "$vc_last" in ''|*[!0-9]*) vc_last=0 ;; esac
-if [ "$vc_last" -eq 0 ] || [ $((NOW - vc_last)) -ge 3600 ]; then
-  aset vc_last "$NOW"
-  if [ "$DRY" != "1" ]; then
-    (python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" version-check --notify >/dev/null 2>&1 &) || true
-  else
-    silent "dry-run: would run version-check --notify"
-  fi
-fi
+#vc_last=$(astate vc_last)
+#case "$vc_last" in ''|*[!0-9]*) vc_last=0 ;; esac
+#if [ "$vc_last" -eq 0 ] || [ $((NOW - vc_last)) -ge 3600 ]; then
+#  aset vc_last "$NOW"
+#  if [ "$DRY" != "1" ]; then
+#    (python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" version-check --notify >/dev/null 2>&1 &) || true
+#  else
+#    silent "dry-run: would run version-check --notify"
+#  fi
+#fi
 
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
